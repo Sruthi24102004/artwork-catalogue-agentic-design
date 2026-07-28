@@ -1,0 +1,62 @@
+erDiagram
+    CATALOGUES ||--o{ PAGES : contains
+    PAGES ||--o{ ARTWORKS : contains
+    ARTISTS ||--o{ ARTWORKS : created
+    PAGES ||--o{ EXTRACTION_RUNS : has
+    ARTWORKS ||--o{ REVIEW_EVENTS : reviewed_by
+
+    CATALOGUES {
+        UUID catalogue_id PK
+        TEXT filename
+        TIMESTAMPTZ uploaded_at
+        INTEGER page_count
+        TEXT status
+    }
+
+    PAGES {
+        UUID page_id PK
+        UUID catalogue_id FK
+        INTEGER page_number
+        TEXT classification
+        TEXT status
+    }
+
+    ARTISTS {
+        UUID artist_id PK
+        TEXT canonical_name
+        TEXT_ARRAY aliases
+    }
+
+    ARTWORKS {
+        UUID artwork_id PK
+        UUID page_id FK
+        UUID artist_id FK
+        TEXT title
+        TEXT medium
+        TEXT dimensions
+        NUMERIC estimate_low
+        NUMERIC estimate_high
+        TEXT currency
+        TEXT image_url
+        TEXT lot_number
+        TIMESTAMPTZ created_at
+    }
+
+    EXTRACTION_RUNS {
+        UUID run_id PK
+        UUID page_id FK
+        TEXT skill_name
+        TEXT skill_version
+        JSONB raw_output
+        NUMERIC confidence
+        TIMESTAMPTZ run_at
+    }
+
+    REVIEW_EVENTS {
+        UUID event_id PK
+        UUID artwork_id FK
+        TEXT reviewer
+        TEXT action
+        JSONB field_diffs
+        TIMESTAMPTZ reviewed_at
+    }
