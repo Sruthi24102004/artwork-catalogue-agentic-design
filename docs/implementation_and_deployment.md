@@ -55,31 +55,45 @@ This isn't free — async adds latency (a message sits in a queue before pickup)
 That distinction — *latency-driven* sync vs. *integrity-driven* sync — is worth having ready, because "why is this one synchronous" is exactly the kind of follow-up this design invites, and having two separately justified reasons (rather than one blanket "sometimes you need sync") shows each boundary was considered individually.
 
 ---
-
 ## 3. Technology Stack per Service
 
-### Decision 1 — one language across all six services
+| Service | Stack | Why this specifically |
+|---|---|---|
+| **Ingestion Service** | Python (FastAPI) + PyMuPDF/pdf2image | FastAPI gives a fast, typed API layer with minimal boilerplate; PyMuPDF reliably splits PDFs into page images and extracts the text layer when the PDF isn't scanned |
+| **Orchestrator Service** | Python (FastAPI) + Temporal.io | Temporal gives durable execution, built-in retry/backoff, and visibility into long-running, multi-step workflows — replacing a lot of hand-rolled state-machine logic (full reasoning below) |
+| **Extraction Service** | Python (FastAPI) + async workers (Celery or Temporal workers) | Python has the strongest ecosystem for calling AI/vision provider APIs and parsing structured LLM output; async workers let multiple pages extract concurrently without blocking |
+| **Validation Service** | Python (FastAPI) + PostgreSQL `pg_trgm` | `pg_trgm` gives "good enough" fuzzy artist-name matching (e.g. "Picasso" vs. "P. Picasso") without standing up a separate search engine; swappable for Elasticsearch later if matching needs grow |
+| **Review Service (HITL)** | Backend: FastAPI. Frontend: React + TypeScript | React is a practical default for an image-heavy, inline-editable review UI; FastAPI backend keeps the same language/tooling as the rest of the pipeline |
+| **Persistence Service** | Python (FastAPI) + SQLAlchemy | SQLAlchemy gives transactional control (needed to write `artworks` + `review_events` atomically) and works cleanly with PostgreSQL-specific types like JSONB |
 
-The tempting alternative is "best tool per service": Node for the Review Service's backend since it's frontend-adjacent, maybe Go for the I/O-heavy Extraction Service. For a system this size, that's usually a trap rather than rigor.
+### The reasoning behind it — two decisions, explained in full
+
+**Decision 1 — one language across all six services, not "best tool per service."**
+
+The tempting alternative is picking the ideal language per service in isolation: Node for the Review Service's backend since it's frontend-adjacent, maybe Go for the I/O-heavy Extraction Service. For a system this size, that's usually a trap rather than rigor.
 
 - **Operational surface is the real constraint, not per-service optimality.** Every added language means a separate dependency-management approach, a separate lint/test convention, a separate base Docker image to patch, and a team that has to debug production issues across more than one language. For a small platform team, that overhead compounds faster than the performance gains are worth.
 - **None of the six services has a workload extreme enough to demand a different runtime.** Each one does roughly the same shape of work: consume a queue message, call something, produce a message or response. If one service were doing heavy numerical computation or needed extreme low-latency, that would be a real argument for a different language — nothing here rises to that bar.
 - **Python fits the AI-heavy parts well**, and standardizing on it means that ecosystem investment (AI provider SDKs, structured-output parsing, PDF/image libraries like PyMuPDF) compounds across all six services instead of being siloed in one.
 - **The honest cost:** a Node/React-native team might genuinely ship the Review Service faster in JavaScript to match their frontend. That's a real trade-off, accepted deliberately in exchange for a smaller, more consistent operational footprint — not an oversight.
 
-### Decision 2 — Temporal.io, the one deliberate exception, for the Orchestrator only
+**Decision 2 — Temporal.io, the one deliberate exception, for the Orchestrator only.**
 
-**The problem it solves.** The Orchestrator walks a page through a long-running, multi-step sequence — classify → extract → validate → maybe wait on a human for minutes or days → persist — where any step can fail transiently and needs retry with backoff, and where a crash mid-workflow must resume exactly where it left off rather than restart or lose track of the page.
+*The problem it solves.* The Orchestrator walks a page through a long-running, multi-step sequence — classify → extract → validate → maybe wait on a human for minutes or days → persist — where any step can fail transiently and needs retry with backoff, and where a crash mid-workflow must resume exactly where it left off rather than restart or lose track of the page.
 
-**What the hand-rolled alternative looks like, and why it tends to rot.** Without a workflow engine, this is typically built as a state column in Postgres, a poller that reads that state and decides the next action, manually written retry/backoff logic, and manual bookkeeping for stuck-record alerting. This *works* when first written, then slowly accumulates the classic distributed-systems edge cases nobody planned for: two workers picking up the same page at once, a retry succeeding but the state update after it failing, a process restarting mid-step. These aren't one big bug — they're a slow accumulation of unhandled edge cases, which is exactly where systems like this tend to degrade in production.
+*What the hand-rolled alternative looks like, and why it tends to rot.* Without a workflow engine, this is typically built as a state column in Postgres, a poller that reads that state and decides the next action, manually written retry/backoff logic, and manual bookkeeping for stuck-record alerting. This *works* when first written, then slowly accumulates the classic distributed-systems edge cases nobody planned for: two workers picking up the same page at once, a retry succeeding but the state update after it failing, a process restarting mid-step. These aren't one big bug — they're a slow accumulation of unhandled edge cases, which is exactly where systems like this tend to degrade in production.
 
-**What Temporal buys instead.** Durable execution as a first-class primitive (a workflow's progress is automatically checkpointed, so a crash resumes without custom recovery code), declarative retries ("retry this activity up to 3 times" rather than hand-written backoff logic), and built-in visibility into every in-flight workflow (e.g. seeing that catalogue X, page 14 has been waiting on human review for 6 hours, without a custom dashboard).
+*What Temporal buys instead.* Durable execution as a first-class primitive (a workflow's progress is automatically checkpointed, so a crash resumes without custom recovery code), declarative retries ("retry this activity up to 3 times" rather than hand-written backoff logic), and built-in visibility into every in-flight workflow (e.g. seeing that catalogue X, page 14 has been waiting on human review for 6 hours, without a custom dashboard).
 
-**Why the Orchestrator specifically, and not everywhere.** The other five services each do one bounded unit of work per message — consume, act, produce, done. Putting Temporal in front of, say, the Persistence Service would be paying infrastructure complexity for a problem that service doesn't have. The Orchestrator is the one place where correctness genuinely depends on durable, long-lived state.
+*Why the Orchestrator specifically, and not everywhere.* The other five services each do one bounded unit of work per message — consume, act, produce, done. Putting Temporal in front of, say, the Persistence Service would be paying infrastructure complexity for a problem that service doesn't have. The Orchestrator is the one place where correctness genuinely depends on durable, long-lived state.
 
-**The honest trade-off.** Temporal is extra infrastructure to run, monitor, and — if the team hasn't used it before — learn. A smaller or less experienced team might reasonably choose the "plain SQS + Postgres state table" alternative instead, trading long-term maintenance risk for short-term simplicity.
+*The honest trade-off.* Temporal is extra infrastructure to run, monitor, and — if the team hasn't used it before — learn. A smaller or less experienced team might reasonably choose the "plain SQS + Postgres state table" alternative instead, trading long-term maintenance risk for short-term simplicity.
 
 **The pattern underneath both decisions:** consistency by default, extra complexity only where a specific, nameable problem justifies it.
+
+### One-sentence version for the walkthrough
+
+*"Every service runs on Python/FastAPI for a smaller, more consistent operational footprint — the one exception is Temporal.io in the Orchestrator, because that's the one service where correctness depends on durable, long-running state, and hand-rolling that kind of retry/recovery logic is exactly where systems like this tend to degrade in production."*
 
 ---
 
