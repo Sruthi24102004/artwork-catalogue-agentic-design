@@ -55,6 +55,7 @@ This isn't free — async adds latency (a message sits in a queue before pickup)
 - **Persistence Service is sync because of data integrity** — a transaction is inherently all-or-nothing; this isn't about speed at all.
 
 That distinction — *latency-driven* sync vs. *integrity-driven* sync — is worth having ready, because "why is this one synchronous" is exactly the kind of follow-up this design invites, and having two separately justified reasons (rather than one blanket "sometimes you need sync") shows each boundary was considered individually.
+
 ---
 ## 3. Technology Stack per Service
 
