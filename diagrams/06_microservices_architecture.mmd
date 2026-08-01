@@ -1,0 +1,39 @@
+flowchart TB
+    classDef client fill:#F1EFE8,stroke:#5F5E5A,color:#2C2C2A,stroke-width:1px;
+    classDef gateway fill:#FDEBD3,stroke:#854F0B,color:#412402,stroke-width:1px;
+    classDef service fill:#E6E4FB,stroke:#534AB7,color:#26215C,stroke-width:1px;
+    classDef queue fill:#FFFFFF,stroke:#534AB7,color:#26215C,stroke-width:2px;
+    classDef store fill:#DCEEFB,stroke:#185FA5,color:#042C53,stroke-width:1px;
+    classDef external fill:#E1F5EE,stroke:#0F6E56,color:#04342C,stroke-width:1px;
+
+    U["Auction House User"]:::client -->|"upload PDF - sync"| GW["API Gateway"]:::gateway
+    GW -->|"sync"| ING["Ingestion Service"]:::service
+
+    ING -->|"store PDF + pages - sync"| S3[("Object Storage - S3")]:::store
+    ING -->|"page.created event - async"| Q1[["Ingestion Queue"]]:::queue
+
+    Q1 -->|async| ORCH["Orchestrator Service"]:::service
+    ORCH -.->|"write job/page state - sync DB write"| DB[("PostgreSQL")]:::store
+    ORCH -->|"dispatch page task - async"| Q2[["Extraction Queue"]]:::queue
+
+    Q2 -->|async| EXT["Extraction Service"]:::service
+    EXT -->|"OCR, vision, extraction - sync API call"| AI["External AI Provider APIs"]:::external
+    EXT -->|"draft record - async"| Q3[["Validation Queue"]]:::queue
+
+    Q3 -->|async| VAL["Validation Service"]:::service
+    VAL -->|"entity lookup - sync DB read"| DB
+    VAL -->|"scored record - async"| Q4[["Review Queue"]]:::queue
+
+    Q4 -->|async| REVSVC["Review Service - HITL API"]:::service
+    REVSVC <-->|"load record / submit decision - sync API"| REV["Human Reviewer"]:::client
+    REVSVC -->|"approved record - async"| PER["Persistence Service"]:::service
+    PER -->|"transactional write - sync"| DB
+
+    subgraph LEGEND["Legend"]
+        direction LR
+        L1["Microservice"]:::service
+        L2[["Message queue"]]:::queue
+        L3[("Data store")]:::store
+        L4["External API"]:::external
+        L5["Client / human"]:::client
+    end
